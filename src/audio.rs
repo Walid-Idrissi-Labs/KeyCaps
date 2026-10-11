@@ -1,11 +1,29 @@
-//! Output: one AudioUnit on the built-in speakers, mixing recorded or synthetic switch sounds. It is
-//! started by the first sound and stopped by the caller once idle, so silence costs nothing.
+//! The sound engine: a bank of recorded or synthetic switch sounds and the mixer that plays
+//! them. Where the mix goes is the platform's business: Core Audio on macOS, the PulseAudio
+//! protocol on Linux. Either way output is started by the first sound and released by the
+//! caller once idle, so silence costs nothing.
 
 use std::cell::UnsafeCell;
-use std::ffi::{c_char, c_void};
 use std::path::Path;
-use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
+
+#[cfg(target_os = "macos")]
+#[path = "coreaudio.rs"]
+mod device;
+#[cfg(target_os = "linux")]
+#[path = "pulse.rs"]
+mod device;
+#[cfg(target_os = "linux")]
+#[path = "wav.rs"]
+mod wav;
+
+#[cfg(target_os = "macos")]
+pub(crate) use device::decode;
+#[cfg(target_os = "linux")]
+pub use device::{fd, pump};
+pub use device::{init, running, stop};
+#[cfg(target_os = "linux")]
+pub(crate) use wav::decode;
 
 /// Switch packs: (menu title, directory under `sounds/`). Recordings from kbsim, see
 /// sounds/LICENSE.md; the last three have no directory and are rendered by `synth`.
@@ -50,9 +68,6 @@ pub const MOUSE: u32 = 12; // + 0 left, 2 right, 4 wheel button; + 1 for its rel
 pub const SCROLL: u32 = 18;
 const SLOTS: usize = 19;
 
-/// The system volume, about half-way on the slider, at which the menu volumes play as
-/// set. Above it Keycaps turns itself down and below it up, so that it stays as loud.
-const REFERENCE_DB: f32 = -18.0;
 /// Nothing is played with more gain than this, so that a few overlapping keys do not
 /// clip. It is what ends the range over which a low system volume can be undone.
 const MAX_GAIN: f32 = 0.8;
@@ -94,18 +109,12 @@ struct Voice {
 }
 const IDLE: Voice = Voice { at: 0, end: 0, frac: 0.0, step: 1.0, l: 0.0, r: 0.0 };
 
-/// Touched by the render thread while the unit runs, by the main thread only while it is stopped.
+/// Touched by whoever mixes while output runs (the render thread on macOS), by the main
+/// thread only while it is stopped.
 struct Bank {
     pcm: Vec<f32>,
     slot: [(usize, usize); SLOTS],
     voices: [Voice; 16],
-}
-
-/// Main thread only.
-struct Unit {
-    unit: *mut c_void,
-    running: bool,
-    rate: f32,
 }
 
 /// A global whose access rules are documented at its use instead of enforced by a lock.
@@ -113,93 +122,18 @@ pub struct Shared<T>(pub UnsafeCell<T>);
 unsafe impl<T> Sync for Shared<T> {}
 
 static BANK: Shared<Bank> = Shared(UnsafeCell::new(Bank { pcm: Vec::new(), slot: [(0, 0); SLOTS], voices: [IDLE; 16] }));
-static UNIT: Shared<Unit> = Shared(UnsafeCell::new(Unit { unit: null_mut(), running: false, rate: 48000.0 }));
 
-// Triggers, main thread -> render thread: slot | pan << 8 | rate << 16.
+// Triggers, main thread -> mixer: slot | pan << 8 | rate << 16.
 static RING: [AtomicU32; 64] = [const { AtomicU32::new(0) }; 64];
 static HEAD: AtomicUsize = AtomicUsize::new(0);
 static TAIL: AtomicUsize = AtomicUsize::new(0);
 static VOLUME: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2]; // keyboard, mouse
-static COMPENSATION: AtomicU32 = AtomicU32::new(1f32.to_bits()); // undoes the system volume
+static COMPENSATION: AtomicU32 = AtomicU32::new(1f32.to_bits()); // undoes the system volume, where the output follows it
 
-#[repr(C)]
-struct Buffer {
-    channels: u32,
-    size: u32,
-    data: *mut c_void,
-}
-#[repr(C)]
-struct BufferList {
-    n: u32,
-    bufs: [Buffer; 2],
-}
-#[repr(C)]
-#[derive(Default)]
-struct Format {
-    rate: f64,
-    id: u32,
-    flags: u32,
-    bytes_per_packet: u32,
-    frames_per_packet: u32,
-    bytes_per_frame: u32,
-    channels: u32,
-    bits: u32,
-    reserved: u32,
-}
-type Render = extern "C" fn(*mut c_void, *mut u32, *const c_void, u32, u32, *mut BufferList) -> i32;
-#[repr(C)]
-struct Callback {
-    f: Render,
-    ctx: *mut c_void,
-}
-
-#[link(name = "AudioToolbox", kind = "framework")]
-#[link(name = "CoreAudio", kind = "framework")]
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn AudioObjectGetPropertyData(obj: u32, addr: *const [u32; 3], qualifier_size: u32, qualifier: *const c_void, size: *mut u32, data: *mut c_void) -> i32;
-    fn AudioObjectAddPropertyListener(obj: u32, addr: *const [u32; 3], listener: extern "C" fn(u32, u32, *const c_void, *mut c_void) -> i32, ctx: *mut c_void) -> i32;
-    fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, encoding: u32) -> *mut c_void;
-    fn CFURLCreateFromFileSystemRepresentation(alloc: *const c_void, path: *const u8, len: isize, is_dir: bool) -> *mut c_void;
-    fn CFRelease(obj: *mut c_void);
-    fn ExtAudioFileOpenURL(url: *mut c_void, out: *mut *mut c_void) -> i32;
-    fn ExtAudioFileSetProperty(file: *mut c_void, id: u32, size: u32, data: *const c_void) -> i32;
-    fn ExtAudioFileRead(file: *mut c_void, frames: *mut u32, data: *mut BufferList) -> i32;
-    fn ExtAudioFileDispose(file: *mut c_void) -> i32;
-    fn AudioComponentFindNext(after: *mut c_void, desc: *const u32) -> *mut c_void;
-    fn AudioComponentInstanceNew(comp: *mut c_void, out: *mut *mut c_void) -> i32;
-    fn AudioUnitGetProperty(u: *mut c_void, id: u32, scope: u32, el: u32, data: *mut c_void, size: *mut u32) -> i32;
-    fn AudioUnitSetProperty(u: *mut c_void, id: u32, scope: u32, el: u32, data: *const c_void, size: u32) -> i32;
-    fn AudioUnitInitialize(u: *mut c_void) -> i32;
-    fn AudioOutputUnitStart(u: *mut c_void) -> i32;
-    fn AudioOutputUnitStop(u: *mut c_void) -> i32;
-}
-
-const STREAM_FORMAT: u32 = 8;
-const RENDER_CALLBACK: u32 = 23;
-const CURRENT_DEVICE: u32 = 2000;
-const SCOPE_GLOBAL: u32 = 0;
-const SCOPE_INPUT: u32 = 1;
-const SCOPE_OUTPUT: u32 = 2;
-const OUTPUT_IS_SILENCE: u32 = 1 << 4;
-
-const fn fourcc(s: &[u8; 4]) -> u32 {
-    u32::from_be_bytes(*s)
-}
-
-/// 32-bit float PCM, packed; `planar` gives each channel its own buffer.
-fn pcm_format(rate: f64, channels: u32, planar: bool) -> Format {
-    Format { rate, id: fourcc(b"lpcm"), flags: 1 | 8 | if planar { 32 } else { 0 }, bytes_per_packet: 4, frames_per_packet: 1, bytes_per_frame: 4, channels, bits: 32, reserved: 0 }
-}
-
-extern "C" fn render(_: *mut c_void, flags: *mut u32, _: *const c_void, _: u32, frames: u32, io: *mut BufferList) -> i32 {
-    let (b, io, n) = unsafe { (&mut *BANK.0.get(), &mut *io, frames as usize) };
-    if io.n != 2 {
-        return 0;
-    }
-    let (l, r) = unsafe {
-        (std::slice::from_raw_parts_mut(io.bufs[0].data as *mut f32, n), std::slice::from_raw_parts_mut(io.bufs[1].data as *mut f32, n))
-    };
+/// Mixes the next `l.len()` frames into both channels, starting the sounds queued since
+/// the last call. True if nothing sounded. Called by the output.
+fn mix(l: &mut [f32], r: &mut [f32]) -> bool {
+    let b = unsafe { &mut *BANK.0.get() };
     l.fill(0.0);
     r.fill(0.0);
 
@@ -226,7 +160,7 @@ extern "C" fn render(_: *mut c_void, flags: *mut u32, _: *const c_void, _: u32, 
     let mut silent = true;
     for v in &mut b.voices {
         // Linear interpolation between neighbours, so a voice needs two samples left.
-        for i in 0..n {
+        for i in 0..l.len() {
             if v.at + 1 >= v.end {
                 break;
             }
@@ -240,105 +174,7 @@ extern "C" fn render(_: *mut c_void, flags: *mut u32, _: *const c_void, _: u32, 
             v.frac -= whole as f32;
         }
     }
-    if silent {
-        unsafe { *flags |= OUTPUT_IS_SILENCE };
-    }
-    0
-}
-
-/// The gain that undoes a system volume of `db` decibels.
-fn compensation(db: f32) -> f32 {
-    10f32.powf((REFERENCE_DB - db) / 20.0)
-}
-
-/// Called by the system when the output device's volume changes, and once at start:
-/// stores the gain that undoes it. A device without a main volume is left alone.
-extern "C" fn volume_changed(device: u32, _: u32, _: *const c_void, _: *mut c_void) -> i32 {
-    let (mut db, mut size) = (0f32, 4u32);
-    let main_volume_db = [fourcc(b"vold"), fourcc(b"outp"), 0];
-    let known = unsafe { AudioObjectGetPropertyData(device, &main_volume_db, 0, null(), &mut size, &raw mut db as _) } == 0;
-    COMPENSATION.store(if known { compensation(db) } else { 1.0 }.to_bits(), Relaxed);
-    0
-}
-
-/// The built-in speakers' device id.
-// shortcut: found by their Apple-silicon UID, so an Intel Mac falls back to whatever
-// output was the default at launch; enumerate the devices to support those.
-fn speakers() -> Option<u32> {
-    unsafe {
-        let uid = CFStringCreateWithCString(null(), c"BuiltInSpeakerDevice".as_ptr(), 0x0800_0100); // UTF-8
-        let (mut dev, mut size) = (0u32, 4u32);
-        // On the system object, 'uidd' translates a UID into a device id (0 = no such device).
-        let err = AudioObjectGetPropertyData(1, &[fourcc(b"uidd"), fourcc(b"glob"), 0], 8, &raw const uid as _, &mut size, &raw mut dev as _);
-        CFRelease(uid);
-        (err == 0 && dev != 0).then_some(dev)
-    }
-}
-
-/// Opens the built-in speakers, whatever the system output is. On failure the app stays silent.
-pub fn init() {
-    unsafe {
-        let desc = [fourcc(b"auou"), fourcc(b"ahal"), fourcc(b"appl"), 0, 0];
-        let comp = AudioComponentFindNext(null_mut(), desc.as_ptr());
-        let mut unit = null_mut();
-        if comp.is_null() || AudioComponentInstanceNew(comp, &mut unit) != 0 {
-            return eprintln!("keycaps: no audio output");
-        }
-        match speakers() {
-            Some(dev) if AudioUnitSetProperty(unit, CURRENT_DEVICE, SCOPE_GLOBAL, 0, &raw const dev as _, 4) == 0 => {}
-            _ => eprintln!("keycaps: built-in speakers not available, using the default output"),
-        }
-        // Mix at the device rate so the unit does not have to resample.
-        let mut dev = Format::default();
-        let mut size = size_of::<Format>() as u32;
-        AudioUnitGetProperty(unit, STREAM_FORMAT, SCOPE_OUTPUT, 0, &raw mut dev as _, &mut size);
-        let rate = if dev.rate >= 8000.0 { dev.rate } else { 48000.0 };
-        let fmt = pcm_format(rate, 2, true);
-        let cb = Callback { f: render, ctx: null_mut() };
-        if AudioUnitSetProperty(unit, STREAM_FORMAT, SCOPE_INPUT, 0, &raw const fmt as _, size_of::<Format>() as u32) != 0
-            || AudioUnitSetProperty(unit, RENDER_CALLBACK, SCOPE_INPUT, 0, &raw const cb as _, size_of::<Callback>() as u32) != 0
-            || AudioUnitInitialize(unit) != 0
-        {
-            return eprintln!("keycaps: audio output setup failed");
-        }
-        // Loudness is set by the menu volumes alone: follow the device's volume to undo it.
-        let (mut device, mut size) = (0u32, 4u32);
-        if AudioUnitGetProperty(unit, CURRENT_DEVICE, SCOPE_GLOBAL, 0, &raw mut device as _, &mut size) == 0 {
-            AudioObjectAddPropertyListener(device, &[fourcc(b"volm"), fourcc(b"outp"), 0], volume_changed, null_mut());
-            volume_changed(device, 0, null(), null_mut());
-        }
-        *UNIT.0.get() = Unit { unit, running: false, rate: rate as f32 };
-    }
-}
-
-/// Decodes any file Core Audio can read to mono at `rate`. Empty if it is missing or unreadable.
-pub(crate) fn decode(path: &Path, rate: f64) -> Vec<f32> {
-    let mut out = Vec::new();
-    let bytes = path.as_os_str().as_encoded_bytes();
-    unsafe {
-        let url = CFURLCreateFromFileSystemRepresentation(null(), bytes.as_ptr(), bytes.len() as isize, false);
-        if url.is_null() {
-            return out;
-        }
-        let mut file = null_mut();
-        if ExtAudioFileOpenURL(url, &mut file) == 0 {
-            let fmt = pcm_format(rate, 1, false);
-            if ExtAudioFileSetProperty(file, fourcc(b"cfmt"), size_of::<Format>() as u32, &raw const fmt as _) == 0 {
-                let mut chunk = [0f32; 4096];
-                loop {
-                    let mut frames = chunk.len() as u32;
-                    let mut io = BufferList { n: 1, bufs: [Buffer { channels: 1, size: 4 * frames, data: chunk.as_mut_ptr() as _ }, Buffer { channels: 0, size: 0, data: null_mut() }] };
-                    if ExtAudioFileRead(file, &mut frames, &mut io) != 0 || frames == 0 {
-                        break;
-                    }
-                    out.extend_from_slice(&chunk[..frames as usize]);
-                }
-            }
-            ExtAudioFileDispose(file);
-        }
-        CFRelease(url);
-    }
-    out
+    silent
 }
 
 /// Appends `x` to `out`, cut to start 2 ms before its hit and to end where it has died
@@ -378,19 +214,21 @@ pub(crate) fn shape(x: &[f32], rate: f32, gate: bool, out: &mut Vec<f32>) -> f32
 
 /// Fills the bank with switch pack `dir` (decoded from `root/dir`, or rendered if it is
 /// a synthetic one) and mouse pack `mouse` (from `root/mouse`). False if the switch
-/// recordings are missing. Stops output first.
+/// recordings are missing.
 pub fn load(root: &Path, dir: &str, mouse: &str) -> bool {
+    // The render thread has to be out of the bank while it changes. Linux mixes on this thread.
+    #[cfg(target_os = "macos")]
     stop();
-    let (b, rate) = unsafe { (&mut *BANK.0.get(), (*UNIT.0.get()).rate) };
+    let (b, rate) = (unsafe { &mut *BANK.0.get() }, device::rate());
     b.pcm.clear();
     b.voices = [IDLE; 16];
     let mut peaks = [0f32; SLOTS];
     for (i, file) in FILES.iter().enumerate() {
         let x = if i < MOUSE as usize {
-            crate::synth::render(dir, i, rate).unwrap_or_else(|| decode(&root.join(dir).join(format!("{file}.mp3")), rate as f64))
+            crate::synth::render(dir, i, rate).unwrap_or_else(|| decode(&root.join(dir).join(format!("{file}.wav")), rate as f64))
         } else {
             let from = root.join("mouse").join(if i < SCROLL as usize { mouse } else { "g502x-wireless" });
-            Some(decode(&from.join(format!("{file}.mp3")), rate as f64)).filter(|x| !x.is_empty()).unwrap_or_else(|| decode(&from.join(format!("{file}.wav")), rate as f64))
+            decode(&from.join(format!("{file}.wav")), rate as f64)
         };
         let at = b.pcm.len();
         peaks[i] = shape(&x, rate, i >= MOUSE as usize, &mut b.pcm);
@@ -437,23 +275,7 @@ pub fn play(slot: u32, pan: f32, rate: f32) {
         RING[h % RING.len()].store(slot | (((pan.clamp(-1.0, 1.0) + 1.0) * 127.5).round() as u32) << 8 | ((rate * 16384.0) as u32).clamp(4096, 0xFFFF) << 16, Relaxed);
         HEAD.store(h.wrapping_add(1), Release);
     }
-    let u = unsafe { &mut *UNIT.0.get() };
-    if !u.running && !u.unit.is_null() {
-        u.running = unsafe { AudioOutputUnitStart(u.unit) } == 0;
-    }
-}
-
-/// Stops output; returns only once the render thread is out of the callback.
-pub fn stop() {
-    let u = unsafe { &mut *UNIT.0.get() };
-    if u.running {
-        unsafe { AudioOutputUnitStop(u.unit) };
-        u.running = false;
-    }
-}
-
-pub fn running() -> bool {
-    unsafe { (*UNIT.0.get()).running }
+    device::start();
 }
 
 /// Keyboard and mouse volume, each 0..=1. The 0.6 leaves room to undo a low system volume.
@@ -462,9 +284,16 @@ pub fn set_volume(keys: f32, mouse: f32) {
     VOLUME[1].store((mouse * 0.6).to_bits(), Relaxed);
 }
 
-/// True once the render thread has picked up every queued sound.
+/// True once the mixer has picked up every queued sound.
 pub fn drained() -> bool {
     HEAD.load(Relaxed) == TAIL.load(Relaxed)
+}
+
+/// Forgets the queued sounds, for when there is nowhere to play them: they would
+/// otherwise all come out later.
+#[cfg(target_os = "linux")]
+fn discard() {
+    TAIL.store(HEAD.load(Relaxed), Relaxed);
 }
 
 #[cfg(test)]
@@ -475,27 +304,17 @@ mod tests {
         v.iter().fold(0f32, |m, x| m.max(x.abs()))
     }
 
-    /// Renders `frames` of stereo output.
-    fn mix(frames: usize) -> (Vec<f32>, Vec<f32>, u32) {
+    /// Mixes `frames` of stereo output: left, right, and whether nothing sounded.
+    fn mixed(frames: usize) -> (Vec<f32>, Vec<f32>, bool) {
         let (mut l, mut r) = (vec![1f32; frames], vec![1f32; frames]);
-        let buf = |v: &mut Vec<f32>| Buffer { channels: 1, size: 4 * frames as u32, data: v.as_mut_ptr() as _ };
-        let mut io = BufferList { n: 2, bufs: [buf(&mut l), buf(&mut r)] };
-        let mut flags = 0;
-        render(null_mut(), &mut flags, null(), 0, frames as u32, &mut io);
-        (l, r, flags)
+        let silent = mix(&mut l, &mut r);
+        (l, r, silent)
     }
 
     /// How much louder left is than right, in dB.
     fn balance(l: &[f32], r: &[f32]) -> f32 {
         let power = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>();
         10.0 * (power(l) / power(r)).log10()
-    }
-
-    #[test]
-    fn compensation_undoes_the_system_volume() {
-        assert!((compensation(REFERENCE_DB) - 1.0).abs() < 1e-6);
-        assert!((compensation(0.0) - 0.1259).abs() < 1e-3); // Mac at full volume: 18 dB down
-        assert!((compensation(-24.0) - 1.995).abs() < 1e-2); // Mac 6 dB below the reference: 6 dB up
     }
 
     #[test]
@@ -552,42 +371,42 @@ mod tests {
         // A key in the middle is the same on both sides.
         set_volume(1.0, 1.0);
         play(PRESS + 2, 0.0, 1.0);
-        let (l, r, flags) = mix(4096);
-        assert!(drained() && peak(&l) > 0.1 && flags & OUTPUT_IS_SILENCE == 0);
+        let (l, r, silent) = mixed(4096);
+        assert!(drained() && peak(&l) > 0.1 && !silent);
         assert!(balance(&l, &r).abs() < 0.1, "centre: {} dB", balance(&l, &r));
-        // It runs out, and silence is flagged.
-        let (l, _, flags) = (0..20).map(|_| mix(4096)).last().unwrap();
-        assert!(peak(&l) == 0.0 && flags & OUTPUT_IS_SILENCE != 0);
+        // It runs out, and silence is reported.
+        let (l, _, silent) = (0..20).map(|_| mixed(4096)).last().unwrap();
+        assert!(peak(&l) == 0.0 && silent);
 
         // Four fifths of the way to the left: 9.5 dB louder there (1.8 against 0.2 in power).
         play(PRESS + 2, -0.8, 1.0);
-        let (l, r, _) = mix(4096);
+        let (l, r, _) = mixed(4096);
         assert!((balance(&l, &r) - 9.5).abs() < 0.3, "four fifths left: {} dB", balance(&l, &r));
         // All the way, and beyond: nothing at all from the right speaker.
         for pan in [-1.0, -1.2] {
-            (0..20).for_each(|_| drop(mix(4096)));
+            (0..20).for_each(|_| drop(mixed(4096)));
             play(PRESS + 2, pan, 1.0);
-            let (l, r, _) = mix(4096);
+            let (l, r, _) = mixed(4096);
             assert!(peak(&l) > 0.1 && peak(&r) == 0.0, "pan {pan}: right peaks at {}", peak(&r));
         }
-        (0..20).for_each(|_| drop(mix(4096)));
+        (0..20).for_each(|_| drop(mixed(4096)));
 
         // The mouse has its own volume.
         let click = |mouse_volume| {
-            (0..20).for_each(|_| drop(mix(4096))); // let the last sound run out
+            (0..20).for_each(|_| drop(mixed(4096))); // let the last sound run out
             set_volume(1.0, mouse_volume);
             play(MOUSE, 0.0, 1.0);
-            peak(&mix(4096).0)
+            peak(&mixed(4096).0)
         };
         let (full, quarter) = (click(1.0), click(0.25));
         assert!(full > 0.05 && (quarter / full - 0.25).abs() < 0.01, "mouse at full {full}, at a quarter {quarter}");
 
         // The system volume is undone, up to the most gain anything may have.
         let key = |undo: f32| {
-            (0..20).for_each(|_| drop(mix(4096)));
+            (0..20).for_each(|_| drop(mixed(4096)));
             COMPENSATION.store(undo.to_bits(), Relaxed);
             play(PRESS + 2, 0.0, 1.0);
-            peak(&mix(4096).0)
+            peak(&mixed(4096).0)
         };
         let (as_set, halved, capped) = (key(1.0), key(0.5), key(100.0));
         assert!((halved / as_set - 0.5).abs() < 0.01 && (capped / as_set - MAX_GAIN / 0.6).abs() < 0.01, "{as_set} {halved} {capped}");
@@ -595,7 +414,7 @@ mod tests {
 
         // More simultaneous sounds than voices, at the extreme rates, must not overrun anything.
         (0..40).for_each(|i| play(i % SLOTS as u32, 0.0, if i % 2 == 0 { 0.01 } else { 3.99 }));
-        let (l, _, _) = (0..100).map(|_| mix(512)).last().unwrap();
+        let (l, _, _) = (0..100).map(|_| mixed(512)).last().unwrap();
         assert!(drained() && l.iter().all(|x| x.is_finite()));
     }
 }

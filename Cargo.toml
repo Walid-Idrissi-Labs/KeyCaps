@@ -1,10 +1,11 @@
 [package]
 name = "keycaps"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 
-# No dependencies: AppKit, CoreGraphics, CoreAudio and Carbon are called directly.
+# No dependencies. On macOS AppKit, Core Graphics, Core Audio and Carbon are called directly;
+# on Linux the kernel's input devices, the sound server and the session bus are.
 
 [profile.release]
 opt-level = 3

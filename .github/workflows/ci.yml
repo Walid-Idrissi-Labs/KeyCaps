@@ -5,19 +5,38 @@ on:
     tags: ["v*"]
   pull_request:
 
+permissions:
+  contents: write # to attach the builds to a release
+
 jobs:
-  build:
+  mac:
     runs-on: macos-latest
-    permissions:
-      contents: write # to attach the disk image to a release
     steps:
       - uses: actions/checkout@v5
       - run: cargo test
       - run: ./build.sh release
-      # A tag vX.Y.Z drafts a release with the disk image, to be checked and published by hand.
+      # A tag vX.Y.Z drafts a release with the builds, to be checked and published by hand.
       - if: startsWith(github.ref, 'refs/tags/v')
         run: |
           grep -q "^version = \"${GITHUB_REF_NAME#v}\"" Cargo.toml || { echo "the tag does not match the version in Cargo.toml"; exit 1; }
           gh release create "$GITHUB_REF_NAME" dist/Keycaps.dmg --draft --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  linux:
+    runs-on: ubuntu-latest
+    needs: mac # which drafts the release this job adds to
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo test
+      - run: ./build.sh release
+      - name: End-to-end test with a real sound server, a virtual keyboard and a stand-in tray
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pulseaudio pulseaudio-utils dbus python3-dbus python3-gi gir1.2-dbusmenu-glib-0.4
+          sudo modprobe uinput || true
+          tests/linux/run.sh dist/linux-x86_64/keycaps
+      - if: startsWith(github.ref, 'refs/tags/v')
+        run: gh release upload "$GITHUB_REF_NAME" dist/keycaps-linux-x86_64.tar.gz dist/keycaps-linux-aarch64.tar.gz
         env:
           GH_TOKEN: ${{ github.token }}

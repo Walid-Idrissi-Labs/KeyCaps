@@ -121,21 +121,22 @@ hero = (
     + text(442, 68.5, "Real switch recordings · free and open source", 15, "soft", 600, "start", ' textLength="336" lengthAdjust="spacingAndGlyphs"')
     + text(600, 178, "Quiet keys.", 86, "ink", 700, extra=' letter-spacing="-2.5"')
     + f'<text x="600" y="270" font-size="92" text-anchor="middle" class="serif accent" letter-spacing="-1">Mechanical sound.</text>'
-    + text(600, 326, "Thirteen recorded switches and seven mice, played from your Mac’s menu bar.", 23, "soft", 400)
+    + text(600, 326, "Thirteen recorded switches and seven mice, for macOS and Linux.", 23, "soft", 400)
     + f'<rect x="{bx - 18:g}" y="{by - 18:g}" width="{board_w + 36:g}" height="{board_h + 36:g}" rx="20" style="fill:var(--case)"/>'
     + keys
 )
-svg("hero.svg", 1200, 680, "Quiet keys. Mechanical sound. Thirteen recorded switches and seven mice, played from your Mac's menu bar.", hero, KEY_STYLE, gradient("ground", "ground-a", "ground-b") + KEY_DEFS)
+svg("hero.svg", 1200, 680, "Quiet keys. Mechanical sound. Thirteen recorded switches and seven mice, for macOS and Linux.", hero, KEY_STYLE, gradient("ground", "ground-a", "ground-b") + KEY_DEFS)
 
 # ---------------------------------------------------------------- buttons
 ARROW = '<path d="M0 -9V5M-6 0L0 6L6 0M-8 10H8" fill="none" style="stroke:var(--on)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>'
-svg(
-    "download.svg", 264, 56, "Download for macOS",
-    '<rect x="1" y="1" width="262" height="54" rx="27" style="fill:var(--ink);stroke:var(--edge)"/>'
-    f'<g transform="translate(42 27)">{ARROW}</g>'
-    + text(66, 34, "Download for macOS", 18, "on", 650, "start", ' textLength="166" lengthAdjust="spacingAndGlyphs"'),
-    "svg{--on:#ffffff}@media (prefers-color-scheme:dark){svg{--on:#1c1c1e}}.on{fill:var(--on)}",
-)
+for name, label in [("download.svg", "Download for macOS"), ("linux.svg", "Download for Linux")]:
+    svg(
+        name, 264, 56, label,
+        '<rect x="1" y="1" width="262" height="54" rx="27" style="fill:var(--ink);stroke:var(--edge)"/>'
+        f'<g transform="translate(42 27)">{ARROW}</g>'
+        + text(66, 34, label, 18, "on", 650, "start", ' textLength="166" lengthAdjust="spacingAndGlyphs"'),
+        "svg{--on:#ffffff}@media (prefers-color-scheme:dark){svg{--on:#1c1c1e}}.on{fill:var(--on)}",
+    )
 svg(
     "source.svg", 216, 56, "Build from source",
     '<rect x="1" y="1" width="214" height="54" rx="27" style="fill:var(--pill);stroke:var(--menu-edge)"/>'
@@ -254,7 +255,7 @@ svg("spatial.svg", W, H, "How loud each key of the home row is in the left and t
 # ---------------------------------------------------------------- stats
 STATS = [
     ("13", "recorded switches"), ("7", "mice, button by button"), ("0%", "CPU while you rest"), ("0", "key presses stored or sent"),
-    ("2 ms", "from sample start to the hit"), ("±3%", "pitch drift, stroke to stroke"), ("2.9 MB", "download, sounds included"), ("0", "dependencies"),
+    ("2 ms", "from sample start to the hit"), ("±3%", "pitch drift, stroke to stroke"), ("1.4 MB", "to download on Linux, 3.4 on macOS"), ("0", "dependencies"),
 ]
 CW, CH, CG = 282, 126, 24
 cards = ""

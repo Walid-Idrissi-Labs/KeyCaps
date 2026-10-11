@@ -7,3 +7,5 @@ LICENSE-MechVibesPlusPlus) for all packs except g502x-wireless.
 scroll-down and scroll-up are the wheel button being pressed and released (the middle
 click), not scroll ticks. The g502x-wireless files were renamed to match the others:
 primary_* -> left-*, secondary_* -> right-*, middle -> scroll-down.
+
+All files are stored as 16-bit mono WAV: those that were MP3 or stereo were converted.
