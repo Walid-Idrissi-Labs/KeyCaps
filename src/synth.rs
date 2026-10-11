@@ -109,7 +109,7 @@ mod tests {
     /// its own space, enter or backspace uses the home row, like `audio::load`.
     fn recording(from: &str, slot: usize) -> Vec<f32> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sounds").join(from);
-        let read = |i: usize| decode(&dir.join(format!("{}.mp3", FILES[i])), RATE as f64);
+        let read = |i: usize| decode(&dir.join(format!("{}.wav", FILES[i])), RATE as f64);
         let x = Some(read(slot)).filter(|x| !x.is_empty()).unwrap_or_else(|| read(if slot < 8 { 2 } else { 8 }));
         let mut out = Vec::new();
         shape(&x, RATE, false, &mut out);
