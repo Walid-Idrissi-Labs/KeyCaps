@@ -1,0 +1,9 @@
+Mouse recordings from keyboardsounds-pro by Nathan Fiscaletti,
+https://github.com/keyboard-sounds/keyboardsounds-pro (desktop/bundled-profiles at commit
+bac56ac700635c512e57621f35780c5b79eba4cd), MIT licence: see LICENSE. Its profiles credit
+MechVibesPlusPlus (https://github.com/PyroCalzone/MechVibesPlusPlus, MIT: see
+LICENSE-MechVibesPlusPlus) for all packs except g502x-wireless.
+
+scroll-down and scroll-up are the wheel button being pressed and released (the middle
+click), not scroll ticks. The g502x-wireless files were renamed to match the others:
+primary_* -> left-*, secondary_* -> right-*, middle -> scroll-down.

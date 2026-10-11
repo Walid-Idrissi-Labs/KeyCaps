@@ -1,0 +1,2 @@
+Switch recordings from kbsim by Thomas Lai, https://github.com/tplai/kbsim
+(src/assets/audio at commit ba103f3b0afa9dab80447aa2e7e2ed80b6bd80e4), MIT licence: see LICENSE.md.

@@ -1,0 +1,15 @@
+/target
+/dist
+/Keycaps.app
+/output
+.DS_Store
+
+# Of the icon work only the finished icon is tracked. Its sources, the other finishes
+# and the export scripts stay local.
+/assets/icons/**
+!/assets/icons/**/
+!/assets/icons/industrial/Keycaps-Titanium-K.*
+!/assets/icons/industrial/Keycaps-Titanium-K.iconset/*
+!/assets/icons/industrial/menubar-titanium-k/*
+/scripts/*
+!/scripts/readme-art.py
