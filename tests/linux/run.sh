@@ -31,20 +31,23 @@ trap cleanup EXIT
 fail() { echo "FAILED: $1"; cat "$tmp/keycaps.log"; exit 1; }
 expect() { echo "$2" | grep -q -- "$3" || fail "$1: expected \"$3\" in: $2"; echo "  ok    $1"; }
 record() { parecord --device=tap.monitor --rate=48000 --channels=2 --format=s16le --raw --latency-msec=20 "$tmp/sound.raw" & recorder=$!; sleep 0.8; }
-heard() { sleep 0.6; kill -INT $recorder; wait $recorder 2>/dev/null || true; python3 "$here/sounds.py" "$tmp/sound.raw" "$2" || fail "$1"; echo "  ok    $1"; }
+heard() { sleep 0.6; kill -INT $recorder; wait $recorder 2>/dev/null || true; python3 "$here/sounds.py" "$tmp/sound.raw" "$2" $3 || fail "$1"; echo "  ok    $1"; }
 
 # A sound server of its own, with an output that never rewrites what it has played, so
 # that the recording of it is faithful.
 pulseaudio -n --daemonize=yes --exit-idle-time=-1 --load=module-native-protocol-unix \
     --load="module-null-sink sink_name=tap norewinds=1 rate=48000 channels=2 format=s16le"
 pactl set-default-sink tap
+pactl set-sink-volume tap 100%
 
 "$app" > "$tmp/keycaps.log" 2>&1 &
 sleep 0.5
 expect "it starts with the first-run settings" "$("$app" status)" "switch cream"
 
 echo "sound"
-record; "$app" volume 60; heard "a volume command plays a key in the middle" "C"
+# The first sound waits for the output's volume, and turning that down 18 dB is undone.
+record; "$app" volume 60; sleep 0.4; pactl set-sink-volume tap 50%; sleep 0.3; "$app" volume 60
+heard "a volume command plays a key in the middle, as loud whatever the system volume" "C C" even
 record; "$app" spatial wide; heard "a spatial command plays one at the left edge" "L"
 record; "$app" mouse apple-magic-mouse; heard "choosing a mouse plays its click" "C"
 "$app" spatial natural; "$app" mouse off; sleep 0.3

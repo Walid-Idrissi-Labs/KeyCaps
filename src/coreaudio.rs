@@ -1,16 +1,12 @@
 //! Output on macOS: one AudioUnit on the built-in speakers, which pulls from the mixer on
 //! Core Audio's render thread. Core Audio also reads the recordings.
 
-use super::{COMPENSATION, Shared};
+use super::{COMPENSATION, Shared, compensation};
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::Ordering::Relaxed;
-
-/// The system volume, about half-way on the slider, at which the menu volumes play as
-/// set. Above it Keycaps turns itself down and below it up, so that it stays as loud.
-const REFERENCE_DB: f32 = -18.0;
 
 /// Main thread only.
 struct Unit {
@@ -103,11 +99,6 @@ extern "C" fn render(_: *mut c_void, flags: *mut u32, _: *const c_void, _: u32, 
         unsafe { *flags |= OUTPUT_IS_SILENCE };
     }
     0
-}
-
-/// The gain that undoes a system volume of `db` decibels.
-fn compensation(db: f32) -> f32 {
-    10f32.powf((REFERENCE_DB - db) / 20.0)
 }
 
 /// Called by the system when the output device's volume changes, and once at start:
@@ -224,16 +215,4 @@ pub fn stop() {
 
 pub fn running() -> bool {
     unsafe { (*UNIT.0.get()).running }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compensation_undoes_the_system_volume() {
-        assert!((compensation(REFERENCE_DB) - 1.0).abs() < 1e-6);
-        assert!((compensation(0.0) - 0.1259).abs() < 1e-3); // Mac at full volume: 18 dB down
-        assert!((compensation(-24.0) - 1.995).abs() < 1e-2); // Mac 6 dB below the reference: 6 dB up
-    }
 }

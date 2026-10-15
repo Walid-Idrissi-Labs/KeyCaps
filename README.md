@@ -99,7 +99,7 @@ The left button, right button and wheel click of seven mice, each with its press
 <td valign="top">
 <b>As loud as you set it</b>
 <br>
-On macOS, Keycaps follows the Mac's volume and compensates for it, so the clicks stay where you put them while you turn your music up or down, until the Mac gets too quiet for that. On Linux, Keycaps has its own slider in the system's volume mixer.
+Keycaps follows the system volume and compensates for it, so the clicks stay where you put them while you turn your music up or down, until the speakers get too quiet for that. On Linux it also has its own slider in the system's volume mixer.
 </td>
 <td valign="top">
 <b>The whole keyboard</b>

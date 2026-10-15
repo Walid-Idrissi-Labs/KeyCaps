@@ -3,12 +3,13 @@
 //! wants some and plays silence by itself otherwise, so Keycaps writes only while a sound
 //! lasts, on the main thread, and nothing runs in between.
 
-use super::Shared;
+use super::{COMPENSATION, Shared, compensation};
 use std::cell::UnsafeCell;
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 const RATE: u32 = 48000;
@@ -23,8 +24,12 @@ const REPLY: u32 = 2;
 const CREATE_PLAYBACK_STREAM: u32 = 3;
 const AUTH: u32 = 8;
 const SET_CLIENT_NAME: u32 = 9;
+const GET_SINK_INFO: u32 = 21;
+const SUBSCRIBE: u32 = 35;
 const REQUEST: u32 = 61;
 const PLAYBACK_STREAM_KILLED: u32 = 64;
+const SUBSCRIBE_EVENT: u32 = 66;
+const PLAYBACK_STREAM_MOVED: u32 = 78;
 /// The protocol version spoken, which fixes the fields of every message below. 16 is
 /// from 2009; it is the first where a stream can leave its volume to the server.
 const VERSION: u32 = 16;
@@ -34,6 +39,8 @@ const CONTROL: u32 = u32::MAX;
 struct Stream {
     sock: UnixStream,
     channel: Option<u32>, // none until the server has opened the stream
+    sink: u32,            // the device it plays on
+    heard_volume: bool,   // whether that device's volume is known yet
     wanted: usize,        // bytes the server has asked for and not yet received
     input: Vec<u8>,
     asked: Instant, // when the stream was asked for
@@ -105,6 +112,39 @@ fn take(message: &mut &[u8]) -> Option<u32> {
     let (value, rest) = message.strip_prefix(b"L")?.split_first_chunk::<4>()?;
     *message = rest;
     Some(u32::from_be_bytes(*value))
+}
+
+/// Steps over `n` tagged values of the kinds that come before the ones read here.
+fn skip(message: &mut &[u8], n: usize) -> Option<()> {
+    for _ in 0..n {
+        let size = match message.first()? {
+            b'L' => 5,
+            b'a' => 7, // format, channels, rate
+            b'm' => 2 + *message.get(1)? as usize,
+            b't' => 1 + message.iter().position(|&b| b == 0)?,
+            b'N' => 1,
+            _ => return None,
+        };
+        *message = message.get(size..)?;
+    }
+    Some(())
+}
+
+/// The volume of the loudest channel of a device, in decibels, from its description past
+/// its number: name, description, format, channels, owning module, then the volume.
+fn sink_volume(mut message: &[u8]) -> Option<f32> {
+    skip(&mut message, 5)?;
+    let (&n, rest) = message.strip_prefix(b"v")?.split_first()?;
+    let loudest = rest.get(..4 * n as usize)?.chunks_exact(4).map(|c| u32::from_be_bytes(c.try_into().unwrap())).max()?;
+    // Volumes are cubic: 100% is 0 dB, 50% is -18 dB.
+    Some(60.0 * (loudest.max(1) as f32 / 65536.0).log10())
+}
+
+/// Asks for the description of device `sink`, which comes back as the answer to message 4.
+fn ask_volume(sock: &mut UnixStream, sink: u32) -> Result<()> {
+    let mut t = Tags::new(GET_SINK_INFO, 4);
+    t.u32(sink).0.push(b'N'); // by its number, not its name
+    send(sock, CONTROL, &t.0)
 }
 
 /// Waits for the answer to message `sequence` and returns its values.
@@ -187,8 +227,12 @@ fn connect() -> Result<Stream> {
         t.bool(false); // muted_set, dont_inhibit_auto_suspend, fail_on_suspend
     }
     send(&mut sock, CONTROL, &t.0)?;
+    // Loudness is set by the menu volumes alone: be told of changes to devices, to undo their volume.
+    // shortcut: with PulseAudio's flat volumes (off by default and absent from PipeWire) the
+    // device's volume follows the loudest stream, which this would wrongly undo.
+    send(&mut sock, CONTROL, &Tags::new(SUBSCRIBE, 3).u32(1).0)?; // 1: devices
     sock.set_nonblocking(true)?;
-    Ok(Stream { sock, channel: None, wanted: 0, input: Vec::new(), asked: Instant::now() })
+    Ok(Stream { sock, channel: None, sink: u32::MAX, heard_volume: false, wanted: 0, input: Vec::new(), asked: Instant::now() })
 }
 
 /// Notes what the server has asked for since the last look, then mixes that much, for as
@@ -216,14 +260,31 @@ fn feed(s: &mut Stream) -> Result<()> {
         let mut message = &s.input[20..length];
         if s.input[4..8] == CONTROL.to_be_bytes() {
             match (take(&mut message), take(&mut message), take(&mut message)) {
-                // The stream is open: its channel, then (skipped) its number, then how much it wants.
+                // The stream is open: its channel, then (skipped) its number, then how much it
+                // wants, then (skipped) its buffer, format and channels, then its device.
                 (Some(REPLY), Some(2), channel) => {
                     (s.channel, s.wanted) = (channel, take(&mut message).and_then(|_| take(&mut message)).unwrap_or(0) as usize);
+                    s.sink = skip(&mut message, 6).and_then(|_| take(&mut message)).unwrap_or(u32::MAX);
+                    ask_volume(&mut s.sock, s.sink)?;
                     if s.asked.elapsed() > Duration::from_millis(250) {
                         super::discard(); // what was pressed while waiting would all come out at once
                     }
                 }
                 (Some(ERROR), Some(2), code) => return Err(Error::other(format!("the sound server refused the stream (error {})", code.unwrap_or(0)))),
+                // The device's volume, or a refusal, which keeps the last one.
+                (Some(REPLY | ERROR), Some(4), _) => {
+                    if let Some(db) = sink_volume(message) {
+                        COMPENSATION.store(compensation(db).to_bits(), Relaxed);
+                    }
+                    s.heard_volume = true;
+                }
+                // A device changed, and maybe its volume: ask again if it is this stream's.
+                (Some(SUBSCRIBE_EVENT), _, _) if take(&mut message) == Some(s.sink) => ask_volume(&mut s.sock, s.sink)?,
+                // The stream was moved: its channel (skipped), then its new device.
+                (Some(PLAYBACK_STREAM_MOVED), _, _) => {
+                    s.sink = take(&mut message).unwrap_or(u32::MAX);
+                    ask_volume(&mut s.sock, s.sink)?;
+                }
                 (Some(REQUEST), _, _) => s.wanted += take(&mut message).unwrap_or(0) as usize,
                 (Some(PLAYBACK_STREAM_KILLED), _, _) => return Err(ErrorKind::ConnectionAborted.into()),
                 _ => {}
@@ -231,7 +292,8 @@ fn feed(s: &mut Stream) -> Result<()> {
         }
         s.input.drain(..length);
     }
-    let Some(channel) = s.channel else {
+    // Nothing plays before the device's volume is known, or the first sound could be far too loud.
+    let Some(channel) = s.channel.filter(|_| s.heard_volume) else {
         return if s.asked.elapsed() > Duration::from_secs(5) { Err(ErrorKind::TimedOut.into()) } else { Ok(()) };
     };
 
@@ -310,4 +372,19 @@ pub fn stop() {
 
 pub fn running() -> bool {
     unsafe { (*OUT.0.get()).stream.is_some() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_volume_is_read_in_decibels() {
+        // A description past the number: name, description, format, channels, module, a
+        // volume of 25% left and 50% right, not muted.
+        let reply = b"tnull\0tNull Output\0a\x05\x02\0\0\xbb\x80m\x02\x01\x02L\0\0\0\x07v\x02\0\0\x40\0\0\0\x80\00";
+        assert!((sink_volume(reply).unwrap() + 18.06).abs() < 0.01);
+        assert!((compensation(sink_volume(reply).unwrap()) - 1.0).abs() < 0.01); // half-way plays as set
+        assert_eq!(sink_volume(b"L\0\0\0\x05"), None); // a refusal: its error code only
+    }
 }

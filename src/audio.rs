@@ -130,6 +130,16 @@ static TAIL: AtomicUsize = AtomicUsize::new(0);
 static VOLUME: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2]; // keyboard, mouse
 static COMPENSATION: AtomicU32 = AtomicU32::new(1f32.to_bits()); // undoes the system volume, where the output follows it
 
+/// The system volume at which the menu volumes play as set: about 70% of the slider on a
+/// Mac's speakers, half of it on Linux. Above it Keycaps turns itself down and below it up,
+/// so that it stays as loud, until `MAX_GAIN` is reached.
+const REFERENCE_DB: f32 = -18.0;
+
+/// The gain that undoes a system volume of `db` decibels.
+fn compensation(db: f32) -> f32 {
+    10f32.powf((REFERENCE_DB - db) / 20.0)
+}
+
 /// Mixes the next `l.len()` frames into both channels, starting the sounds queued since
 /// the last call. True if nothing sounded. Called by the output.
 fn mix(l: &mut [f32], r: &mut [f32]) -> bool {
@@ -411,6 +421,9 @@ mod tests {
         let (as_set, halved, capped) = (key(1.0), key(0.5), key(100.0));
         assert!((halved / as_set - 0.5).abs() < 0.01 && (capped / as_set - MAX_GAIN / 0.6).abs() < 0.01, "{as_set} {halved} {capped}");
         COMPENSATION.store(1f32.to_bits(), Relaxed);
+        assert!((compensation(REFERENCE_DB) - 1.0).abs() < 1e-6);
+        assert!((compensation(0.0) - 0.1259).abs() < 1e-3); // system at full volume: 18 dB down
+        assert!((compensation(-24.0) - 1.995).abs() < 1e-2); // 6 dB below the reference: 6 dB up
 
         // More simultaneous sounds than voices, at the extreme rates, must not overrun anything.
         (0..40).for_each(|i| play(i % SLOTS as u32, 0.0, if i % 2 == 0 { 0.01 } else { 3.99 }));
